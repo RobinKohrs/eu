@@ -1,0 +1,616 @@
+---
+title: "SPA Europawahlen"
+author: "Robin Kohrs"
+bibliography: refs.bib
+csl: german-council-of-economic-experts.csl
+lang: de
+date: today
+format:
+  html:
+    toc: true
+    toc-location: body
+    toc-title: Übersicht
+    code-fold: true
+    css: style.css
+    theme: cosmo   # cosmo bootswatch theme
+---
+
+
+```{r}
+#| echo: false
+#| message: false
+
+# read data
+library(tidyverse)
+library(here)
+library(glue)
+library(sf)
+library(rajudas)
+library(jsonlite)
+library(DBI)
+library(dtplyr)
+library(DT)
+library(plotly)
+library(DatawRappr)
+here::i_am("analysis/quarto_v2/index.qmd")
+devtools::load_all()
+ggplot2::theme_set(theme_minimal())
+
+replace_party = function(p){
+  p_new = case_when(
+    p == "RENEW" ~ "RENEW",
+    p == "SD" ~ "S&D",
+    p == "EPP" ~ "EVP",
+    p == "ID" ~ "ID",
+    p == "GREEN_EFA" ~ "Grüne/EFA",
+    p == "GUE_NGL" ~ "Die Linke",
+    p == "ECR" ~ "EKR",
+    p == "NI" ~ "Fraktionslos",
+    .default=NA
+  )
+  
+  p_new
+}
+
+```
+
+
+# Grafik 1
+
+## Daten
+
+```{r}
+#| message: false
+#| cache: true
+#| echo: false
+
+path_austrian_votes = makePath(here("output/data/austrian_votes_long.csv"))
+path_votes_long = here("output/data/votes_long.csv")
+path_members_long = here("output/data/members_long.csv")
+
+if(!file.exists(path_austrian_votes)){
+  
+  # data votes
+  data_votes_long = data.table::fread(path_votes_long)
+  data_votes_long = data_votes_long %>%
+    rename(vote_id = id,
+           member_id = member_votes_web_id,
+           position = member_votes_position)
+  
+  # data members
+  data_members_long = data.table::fread(path_members_long) %>%
+    rename(
+      member_id = id,
+      party = group_memberships_group,
+      party_start_date =  group_memberships_start_date,
+      party_end_date =  group_memberships_end_date
+    )
+  
+  # 1. Wahlergebnisse nur für österreichische MEPs
+  data_austrian_meps  = data_members_long %>%
+    filter(country == "AUT")
+
+  # 2. filter the vote data to only contain these IDs
+  data_austrian_votes = data_votes_long %>%
+    filter(member_id %in% data_austrian_meps$member_id)
+
+
+  # join the member data to the vote data
+  data_at = data_austrian_votes %>%
+    left_join(data_austrian_meps, join_by(member_id == member_id))
+  
+  write_csv(data_at, path_austrian_votes)
+}else{
+  print("reading austrian vote data")
+  data_at = read_csv(path_austrian_votes)
+}
+
+path_accordance_at = makePath(here("output/data/austria_accordance.csv"))
+  
+if(!file.exists(path_accordance_at)){
+  
+  # for each vote -> check if two sampled persons acted the same (including non votes)
+  data_compare_2_per_vote = data_at %>%
+    group_by(vote_id) %>%
+    summarise(diff = list(setNames(as.data.frame(t(
+      combn(position, 2, function(x)
+        x[[1]] == x[[2]])
+    )),
+    paste0(
+      combn(glue("{party}-{last_name}"), 2, paste0, collapse = "__")
+    )))) %>% unnest(diff)
+  
+
+  # now devide the number of same votes by the number of all votes they had together
+  data_compare_2_per_vote %>%
+    summarise(across(2:ncol(.),
+                     ~ round((
+                       sum(.x, na.rm = T) / length(.x[!is.na(.x)])
+                     ) * 100, 2))) %>%
+    pivot_longer(
+      everything(),
+      names_sep = "__",
+      names_to = c("mep1", "mep2"),
+      values_to = "accordance"
+    ) -> data_one_way
+  
+  
+  ###########
+  # prepare two way
+  ###########
+  
+  data_other_way = data_one_way %>%
+    rename(mep2 = mep1, mep1 = mep2) 
+  
+  # bind the two together
+  data_both_ways = bind_rows(data_one_way, data_other_way)
+  
+  data_both_ways %>% 
+    pivot_wider(
+      names_from = "mep2",
+      values_from = "accordance"
+    ) -> data_wide
+ 
+  data_wide %>%  
+    mutate(
+      order = case_when(
+        str_detect(mep1, "EPP") ~ 1,
+        str_detect(mep1, "SD") ~ 2,
+        str_detect(mep1, "ID") ~ 3,
+        str_detect(mep1, "GREEN") ~ 4,
+        str_detect(mep1, "RENEW") ~ 5,
+        .default = NA
+      )
+    ) %>% 
+    arrange(order, mep1) %>% select(-order) -> data_wide_row_ordered
+  
+  
+  names(data_wide_row_ordered) %>%
+    data.frame(nm = .) %>%
+    mutate(
+      order = case_when(
+        str_detect(nm, "mep1") ~ 0,
+        str_detect(nm, "EPP") ~ 1,
+        str_detect(nm, "SD") ~ 2,
+        str_detect(nm, "ID") ~ 3,
+        str_detect(nm, "GREEN") ~ 4,
+        str_detect(nm, "RENEW") ~ 5,
+        .default = NA
+      )
+    ) %>% 
+    arrange(order, nm) %>% pull(nm) -> col_order
+    
+  
+  # rearrange the columns
+  data_dw = data_wide_row_ordered[,col_order]
+  
+  # put data to datawrapper 
+  dw_data_to_chart(data_dw, "bO49D")
+  
+  cols = map(seq_along(1:ncol(data_dw)), function(i) {
+    
+    if (i == 1) {
+      return(data_dw[, i, drop = F])
+    }
+    
+  data_dw[,i,drop=F] %>% 
+    mutate(
+      across(1, function(x){
+        if_else(row_number() <= i, NA, x)
+      })
+    )
+  }) %>% bind_cols() -> data_half
+  
+  dw_data_to_chart(data_half, "K6GlH")
+  
+  
+  
+  # write out
+  write_csv(data_dw, path_accordance_at)
+}else{
+  data_both_ways = read_csv(path_accordance_at)
+}
+```
+
+## Grafiken
+
+### Wahlverhalte jedes Parlamentariers
+
+```{r}
+#| message: false
+
+data_austrian_votes = read_csv(path_austrian_votes)
+
+data_austrian_votes %>% 
+  group_by(last_name) %>% 
+  mutate(n_votes = n(),
+         name = glue("{party}__{last_name} ({n()})")) %>% 
+  group_by(name, position) %>% 
+  summarise(
+    share_position = n() / first(n_votes),
+    .groups = "drop"
+  ) %>% 
+  select(name, position, share_position) %>% 
+    mutate(
+      order = case_when(
+        str_detect(name, "EPP") ~ 1,
+        str_detect(name, "SD") ~ 2,
+        str_detect(name, "ID") ~ 3,
+        str_detect(name, "GREEN") ~ 4,
+        str_detect(name, "RENEW") ~ 5,
+        .default = NA
+      )
+    ) %>% 
+  arrange(order, name) %>% 
+  select(name, position, share_position) %>% 
+  mutate(share_position=100*share_position) %>% 
+  pivot_wider(
+    names_from = position,
+    values_from = share_position
+  ) -> data_each_member
+
+dw_data_to_chart(data_each_member, "V3DT0")  
+  
+```
+
+<iframe title="Anteil der Stimmen für jede Position für jede(n) MEP" aria-label="Balken (gestapelt)" id="datawrapper-chart-V3DT0" src="https://datawrapper.dwcdn.net/V3DT0/2/" scrolling="no" frameborder="0" style="width: 0; min-width: 100% !important; border: none;" height="650" data-external="1"></iframe><script type="text/javascript">!function(){"use strict";window.addEventListener("message",(function(a){if(void 0!==a.data["datawrapper-height"]){var e=document.querySelectorAll("iframe");for(var t in a.data["datawrapper-height"])for(var r=0;r<e.length;r++)if(e[r].contentWindow===a.source){var i=a.data["datawrapper-height"][t]+"px";e[r].style.height=i}}}))}();
+</script>
+
+
+
+### Heatmap
+
+:::{.column-screen}
+<iframe src="https://datawrapper.dwcdn.net/bO49D/3/" style="width: 100vw; height: 800px;"></iframe>
+:::
+
+```{r heatmap}
+#| message: false
+#| column: page
+#| echo: false
+#| fig-width: 24
+#| fig-height: 20
+
+
+
+data_both_ways %>% 
+  ggplot(aes(mep1, mep2, fill = accordance)) +
+  geom_tile(color="black") +
+  expand_limits(fill=c(0,100)) +
+  scico::scale_fill_scico(
+    palette = "bilbao",
+    labels = function(x)
+      paste0(x, " %")
+  ) +
+  geom_text(aes(label=accordance), color="white") +
+  theme(
+    panel.background = element_blank(),
+    plot.background = element_blank(),
+    panel.grid = element_blank(),
+    axis.text.x = element_text(angle = 90),
+    legend.position = "bottom"
+  ) + labs(y = NULL, fill = "Prozent der Wahlen\nin denen gleich\ngehandelt wurde") -> p
+
+
+# ggplotly(p) %>% layout(legend = list(orientation = "h",
+#                                      x = -0.5))
+
+```
+
+### Heatmap half
+:::{.column-screen}
+<iframe src="https://datawrapper.dwcdn.net/K6GlH" style="width: 100vw; height: 800px;"></iframe>
+:::
+
+# Grafik 2: Abstimmungen mit den meisten Änderungsanträgen
+
+## Daten
+
+```{r aenderungsantraege}
+#| message: false
+
+path_n_aenderungsantraege = makePath(here("output/data/abstimmungen_meiste_aenderungsantraege.csv"))
+path_votes_wide = here("output/data/votes_wide.csv")  
+
+if(!file.exists(path_n_aenderungsantraege)){
+
+  data_votes_wide = data.table::fread(path_votes_wide) %>% 
+    select(-member_votes)
+  
+  data_n_aenderungsantraege = data_votes_wide %>% 
+    mutate(day = lubridate::date(timestamp)) %>% 
+    group_by(reference) %>% 
+    summarise(
+      n_references = n(),
+      first_procedure_title = first(procedure_title),
+      n_procedure_titles_per_reference = length(unique(procedure_title)),
+      timetamps = paste0(unique(timestamp), collapse = ", "),
+      n_days = length(unique(day)),
+      first_id = first(id)
+    ) %>% 
+    arrange(desc(n_references))
+  
+  write_csv(data_n_aenderungsantraege, path_n_aenderungsantraege)
+  
+  # what is in the votes that have no reference
+  data_votes_wide %>% 
+    filter(reference=="") %>% 
+    count(title,sort=T)
+    
+}else{
+  data_n_aenderungsantraege = read_csv(path_n_aenderungsantraege)
+}
+
+data_n_aenderungsantraege %>% 
+  filter(reference != "") %>%
+  slice_head(n=10) %>% 
+  mutate(
+   label = glue("{reference}<br><a href='https://howtheyvote.eu/{first_id}' style='display: inline-block; max-width: 60px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;'>{first_procedure_title}</a>") 
+  ) %>% 
+  dw_data_to_chart("5KUL4")
+
+```
+
+## Grafik
+
+<iframe title="Anzahl an Abstimmungen pro Resolution - die Top10" aria-label="Balken" id="datawrapper-chart-5KUL4" src="https://datawrapper.dwcdn.net/5KUL4/1/" scrolling="no" frameborder="0" style="width: 0; min-width: 100% !important; border: none;" height="328" data-external="1"></iframe><script type="text/javascript">!function(){"use strict";window.addEventListener("message",(function(a){if(void 0!==a.data["datawrapper-height"]){var e=document.querySelectorAll("iframe");for(var t in a.data["datawrapper-height"])for(var r=0;r<e.length;r++)if(e[r].contentWindow===a.source){var i=a.data["datawrapper-height"][t]+"px";e[r].style.height=i}}}))}();
+</script>
+
+
+# (Grafik 3: tba - Inhaltlich)
+
+## Idee 1: Titel aus den Pressereferenzen
+
+```{r}
+#| warning: false
+#| message: false
+
+library("tm")
+library("SnowballC")
+library("wordcloud")
+library("RColorBrewer")
+
+data_votes_wide = read_csv(here("output/data/votes_wide.csv"))
+docs = Corpus(VectorSource(data_votes_wide$procedure_title))
+
+toSpace = content_transformer(function (x , pattern ) gsub(pattern, " ", x))
+docs = tm_map(docs, toSpace, "/")
+docs = tm_map(docs, toSpace, "@")
+docs = tm_map(docs, toSpace, "\\|")
+
+# Convert the text to lower case
+docs <- tm_map(docs, content_transformer(tolower))
+# Remove numbers
+docs <- tm_map(docs, removeNumbers)
+# Remove english common stopwords
+docs <- tm_map(docs, removeWords, stopwords("english"))
+# Remove punctuations
+docs <- tm_map(docs, removePunctuation)
+# Eliminate extra white spaces
+docs <- tm_map(docs, stripWhitespace)
+
+# docs = tm_map(docs, stemDocument)
+dtm <- TermDocumentMatrix(docs)
+m <- as.matrix(dtm)
+v <- sort(rowSums(m),decreasing=TRUE)
+d <- data.frame(word = names(v),freq=v)
+
+set.seed(1234)
+wordcloud(words = d$word, freq = d$freq, min.freq = 1,
+          max.words=200, random.order=FALSE, rot.per=0.35, 
+          colors=brewer.pal(8, "Dark2"))
+```
+
+
+# Grafik 4: Karte
+
+## Daten
+```{r}
+#| message: false
+
+path_data_geo = makePath(here("output/data/data_geo_resolutions.csv"))
+if(!file.exists(path_data_geo)){
+  path_votes_main = makePath(here("output/data/main_votes_unique_mep.csv"))
+  data_main_votes = data.table::fread(path_votes_main) %>% 
+  distinct(vote_id, .keep_all = T) %>% 
+  filter(geo_areas != "[]") %>% 
+  mutate(vote_country = str_replace_all(geo_areas, "\\[|\\]|\\\\|\"", ""),
+         vote_country = str_split(vote_country, ","),
+         vote_country = map(vote_country, str_trim)
+         ) %>% 
+  unnest(vote_country) -> data_cntrs
+  
+  write_csv(data_cntrs, path_data_geo)
+ 
+}else{
+  data_cntrs = read_csv(path_data_geo)
+}
+
+# add the tooltip
+data_cntrs %>% 
+  group_by(vote_country) %>% 
+  summarise(
+    n = n(),
+    tooltip = paste0("<span> - ", procedure_title, "</span>", collapse = "<br>")
+  ) -> data_cntrs_tooltip
+
+
+DatawRappr::dw_data_to_chart(data_cntrs_tooltip, "xreRq")
+
+```
+
+## Grafik
+
+<iframe title="Insgesamt 30 Resolutionen über Themen, welche die Ukraine betreffen" aria-label="Karte" id="datawrapper-chart-xreRq" src="https://datawrapper.dwcdn.net/xreRq/1/" scrolling="no" frameborder="0" style="width: 0; min-width: 100% !important; border: none;" height="380" data-external="1"></iframe><script type="text/javascript">!function(){"use strict";window.addEventListener("message",(function(a){if(void 0!==a.data["datawrapper-height"]){var e=document.querySelectorAll("iframe");for(var t in a.data["datawrapper-height"])for(var r=0;r<e.length;r++)if(e[r].contentWindow===a.source){var i=a.data["datawrapper-height"][t]+"px";e[r].style.height=i}}}))}();
+</script>
+
+
+
+# Grafik 5: Vote Stripes
+
+## Daten
+
+```{r vote_stripes}
+#| message: false
+
+
+path_data_vote_stripes = makePath(here("output/data/data_vote_stripes.csv"))
+if(!file.exists(path_data_vote_stripes)){
+path_all_data = here("output/data/votes_long.csv")
+data_all_votes = data.table::fread(path_all_data)
+
+data_all_votes %>% 
+  filter(is_main==T) %>%
+  group_by(id) %>% 
+  summarise(
+    yes = sum(member_votes_position=="FOR"),
+    no = sum(member_votes_position=="AGAINST"),
+    abstention = sum(member_votes_position=="ABSTENTION"),
+    no_vote = sum(member_votes_position=="DID_NOT_VOTE"),
+    day = first(timestamp),
+    is_main = first(is_main),
+    procedure_title = first(procedure_title)
+  ) %>% 
+  pivot_longer(
+    yes:no_vote,
+    names_to = "class",
+    values_to = "vals"
+  ) %>% 
+  group_by(id) %>% 
+  mutate(vote=cur_group_id()) -> data_vote_stripes
+  write_csv(data_vote_stripes, path_data_vote_stripes)
+}else{
+  data_vote_stripes = read_csv(path_data_vote_stripes)
+}
+
+## load it to flourish
+op_vote_stripes_flourish = makePath(here("output/print/5_vote_stripes/vote_stripes_data_flourish.csv"))
+data_vote_stripes %>% 
+  select(id, class, vals) %>% 
+  mutate(vals = if_else(class == "no_vote", vals * -1, vals)) %>% 
+  group_by(id) %>% 
+  mutate(
+    id = cur_group_id()
+  ) %>% 
+  pivot_wider(
+    names_from = class,
+    values_from = vals
+  ) %>% 
+write_csv(op_vote_stripes_flourish)
+
+
+  
+```
+## Grafik
+
+```{r}
+#| column: screen
+#| fig-width: 24
+#| fig-height: 20
+#| message: false
+
+data_vote_stripes %>%
+  mutate(vals = if_else(class == "no_vote", vals * -1, vals),
+         label = as.character(glue("{id}_{day}"))) %>%
+  ggplot(aes(vote_cons_id, vals, fill = class, label=label )) +
+  geom_bar(stat = "identity") -> p
+
+ggplotly(p)
+
+```
+
+
+### Abstimmungen mit den meisten Ja/Nein/Enthalungen etc
+
+```{r}
+#| column: page
+#| message: false
+#| fig-width: 20
+#| fig-height: 13
+
+
+read_csv(path_data_vote_stripes) %>% 
+  filter(is_main == T) %>% 
+  group_by(id) %>% 
+  mutate(perc = (vals/sum(vals))*100,
+         sum_votes = sum(vals)) %>% 
+  ungroup() %>% 
+  group_by(class) %>% 
+  filter(perc == max(perc)) %>% 
+  mutate(
+    n = n()
+  ) %>% 
+  ungroup() %>% 
+  mutate(
+    class = if_else(n>1, glue("{class}_{row_number()}"), class),
+    class = fct_reorder(class, vals)
+  ) %>% 
+  dw_data_to_chart("fXhOW")
+  # ggplot(aes(vals*100, class)) +
+  # theme_minimal(base_size=27)  +
+  # labs(title = "Höchste Abstimmungsergebnisse", subtitle = "pro Entscheidungsmöglichkeit", x=NULL, y=NULL) +
+  # scale_x_continuous(labels = function(x) paste0(x, "%")) +
+  # geom_col()
+  
+```
+
+<iframe title="9 Tage vor Weihnachten gingen fast 50  % der Abgeordneten nicht zur Wahl in der es um den Menschenrechtsverteidiger Abdulhadi Al-Khawaja ging" aria-label="Scatterplot" id="datawrapper-chart-fXhOW" src="https://datawrapper.dwcdn.net/fXhOW/1/" scrolling="no" frameborder="0" style="width: 0; min-width: 100% !important; border: none;" height="557" data-external="1"></iframe><script type="text/javascript">!function(){"use strict";window.addEventListener("message",(function(a){if(void 0!==a.data["datawrapper-height"]){var e=document.querySelectorAll("iframe");for(var t in a.data["datawrapper-height"])for(var r=0;r<e.length;r++)if(e[r].contentWindow===a.source){var i=a.data["datawrapper-height"][t]+"px";e[r].style.height=i}}}))}();
+</script>
+
+# Grafik 6: Anteil Resolutionen - Änderungsanträge
+
+## Daten
+
+```{r share}
+#| message: false
+
+path_share_final_non_final = makePath(here("output/data/share_final_non_final.csv"))
+if (!file.exists(path_share_final_non_final)) {
+  path_votes_wide = here("output/data/votes_wide.csv")
+  data_votes_wide = data.table::fread(path_votes_wide)
+  
+  data_is_main = data_votes_wide %>%
+    mutate(is_main = if_else(is_main == 1, "is main", "is not main")) %>%
+    count(is_main)
+  
+  write_csv(data_is_main, path_share_final_non_final)
+} else{
+  data_is_main = read_csv(path_share_final_non_final)
+}
+
+# pie(data_is_main$n, data_is_main$n, col = rainbow(2))
+# legend("topright", legend = data_is_main$is_main, fill = rainbow(2))
+
+dw_data_to_chart(data_is_main, "Q3VvE")
+```
+
+## Grafik
+
+<iframe title="9/10 der Abstimmungen sind keine Resolutionen" aria-label="Torten-diagramm" id="datawrapper-chart-Q3VvE" src="https://datawrapper.dwcdn.net/Q3VvE/1/" scrolling="no" frameborder="0" style="width: 0; min-width: 100% !important; border: none;" height="540" data-external="1"></iframe><script type="text/javascript">!function(){"use strict";window.addEventListener("message",(function(a){if(void 0!==a.data["datawrapper-height"]){var e=document.querySelectorAll("iframe");for(var t in a.data["datawrapper-height"])for(var r=0;r<e.length;r++)if(e[r].contentWindow===a.source){var i=a.data["datawrapper-height"][t]+"px";e[r].style.height=i}}}))}();
+</script>
+
+
+# Grafik 7: Wie oft gehen Fraktionen mit dem Endergebnis überein?
+
+## Daten
+
+```{r}
+#| message: false
+path_share_party_final_res = makePath(here("output/data/share_party_final_res.csv"))
+data_share_party_final_res = read_csv(path_share_party_final_res)  
+
+datawrapper_id_party_win = "B9zR3"
+
+
+data_share_party_final_res %>% 
+  mutate(group_memberships_group = replace_party(group_memberships_group))%>%
+  dw_data_to_chart(datawrapper_id_party_win)
+
+```
+
+## Grafik
+
+<iframe title="Die NEOS stimmen fast immer gleich dem Endergebnis ab" aria-label="Balken" id="datawrapper-chart-B9zR3" src="https://datawrapper.dwcdn.net/B9zR3/2/" scrolling="no" frameborder="0" style="width: 0; min-width: 100% !important; border: none;" height="330" data-external="1"></iframe><script type="text/javascript">!function(){"use strict";window.addEventListener("message",(function(a){if(void 0!==a.data["datawrapper-height"]){var e=document.querySelectorAll("iframe");for(var t in a.data["datawrapper-height"])for(var r=0;r<e.length;r++)if(e[r].contentWindow===a.source){var i=a.data["datawrapper-height"][t]+"px";e[r].style.height=i}}}))}();
+</script>
+
+
